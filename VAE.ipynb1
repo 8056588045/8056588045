@@ -1,443 +1,245 @@
-
-
-import os
-import math
-import random
-from pathlib import Path
-import argparse
-import json
-import numpy as np
-import pandas as pd
-from tqdm import trange, tqdm
+# =========================================================
+# Variational Autoencoder (VAE) for Image Anomaly Detection
+# =========================================================
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset, Dataset
-from torchvision import datasets, transforms, utils
+import torch.optim as optim
+from torch.utils.data import DataLoader, random_split, TensorDataset
 
-from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, roc_curve, precision_recall_curve
-
+import numpy as np
 import matplotlib.pyplot as plt
+from sklearn.metrics import precision_score, recall_score, f1_score
 
-# --------------------------
-# Arguments & config
-# --------------------------
-parser = argparse.ArgumentParser()
-parser.add_argument('--data-dir', type=str, default='./data')
-parser.add_argument('--out-dir', type=str, default='./output')
-parser.add_argument('--dataset', type=str, default='MNIST', choices=['MNIST','CIFAR10'])
-parser.add_argument('--normal-class', type=int, default=1, help='Digit/class used as normal during training (MNIST/CIFAR10)')
-parser.add_argument('--latent-dim', type=int, default=16)
-parser.add_argument('--batch-size', type=int, default=128)
-parser.add_argument('--epochs', type=int, default=20)
-parser.add_argument('--lr', type=float, default=1e-3)
-parser.add_argument('--beta', type=float, default=1.0, help='weight of KL term')
-parser.add_argument('--seed', type=int, default=42)
-parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-args = parser.parse_args([]) if __name__ == "__main__" and False else parser.parse_args()
+from torchvision import datasets, transforms
 
-# for safe default when running interactively in some runners:
-if args is None:
-    args = parser.parse_args([])
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Using device:", device)
 
-# --------------------------
-# Reproducibility
-# --------------------------
-torch.manual_seed(args.seed)
-np.random.seed(args.seed)
-random.seed(args.seed)
+# ------------------------------
+# 1) Dataset: MNIST (Normal = digit '0', Anomaly = digit '1')
+# ------------------------------
 
-# --------------------------
-# Output folders
-# --------------------------
-out_dir = Path(args.out_dir)
-out_dir.mkdir(parents=True, exist_ok=True)
-(Path(out_dir) / "plots").mkdir(exist_ok=True)
-(Path(out_dir) / "models").mkdir(exist_ok=True)
+transform = transforms.Compose([
+    transforms.ToTensor()
+])
 
-# --------------------------
-# Model: simple conv VAE (works for MNIST/CIFAR)
-# --------------------------
-class ConvVAE(nn.Module):
-    def __init__(self, in_channels=1, latent_dim=16):
+mnist = datasets.MNIST(root="./data", download=True, transform=transform)
+
+# Normal data = digit 0
+normal_data = torch.stack([mnist[i][0] for i in range(len(mnist)) if mnist[i][1] == 0])
+anomaly_data = torch.stack([mnist[i][0] for i in range(len(mnist)) if mnist[i][1] == 1])
+
+# Dataset split
+n_train = int(0.8 * len(normal_data))
+n_val   = int(0.1 * len(normal_data))
+n_test  = len(normal_data) - n_train - n_val
+
+train_ds = TensorDataset(normal_data[:n_train])
+val_ds   = TensorDataset(normal_data[n_train:n_train+n_val])
+test_normal_ds = TensorDataset(normal_data[n_train+n_val:n_train+n_val+n_test])
+test_anomaly_ds = TensorDataset(anomaly_data[:n_test])
+
+batch_size = 128
+train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_ds, batch_size=batch_size)
+test_normal_loader = DataLoader(test_normal_ds, batch_size=batch_size)
+test_anomaly_loader = DataLoader(test_anomaly_ds, batch_size=batch_size)
+
+print("Train normal:", len(train_ds))
+print("Val normal:", len(val_ds))
+print("Test normal:", len(test_normal_ds))
+print("Test anomaly:", len(test_anomaly_ds))
+
+
+# ------------------------------
+# 2) VAE Model
+# ------------------------------
+
+class Encoder(nn.Module):
+    def __init__(self, latent_dim=16):
         super().__init__()
-        self.latent_dim = latent_dim
-
-        # Encoder: conv layers -> flatten -> linear to mu/logvar
-        self.enc = nn.Sequential(
-            nn.Conv2d(in_channels, 32, 4, 2, 1),  # -> 14x14 if 28x28 input
+        self.net = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(28*28, 256),
             nn.ReLU(),
-            nn.Conv2d(32, 64, 4, 2, 1),  # -> 7x7
-            nn.ReLU(),
-            nn.Conv2d(64, 128, 4, 2, 1),  # -> 4x4 if starting 32x32
+            nn.Linear(256, 128),
             nn.ReLU(),
         )
-        # compute size after convs for flatten -> linear
-        # We'll infer dynamically in forward by using a dummy tensor
-        self.fc_mu = nn.Linear(128 * 3 * 3, latent_dim)  # will adapt below
-        self.fc_logvar = nn.Linear(128 * 3 * 3, latent_dim)
+        self.mu = nn.Linear(128, latent_dim)
+        self.logvar = nn.Linear(128, latent_dim)
 
-        # Decoder: linear from z -> conv transpose stack
-        self.fc_dec = nn.Linear(latent_dim, 128 * 3 * 3)
-        self.dec = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, 4, 2, 1),
+    def forward(self, x):
+        h = self.net(x)
+        return self.mu(h), self.logvar(h)
+
+
+class Decoder(nn.Module):
+    def __init__(self, latent_dim=16):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, 128),
             nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, 4, 2, 1),
+            nn.Linear(128, 256),
             nn.ReLU(),
-            nn.ConvTranspose2d(32, in_channels, 4, 2, 1),
-            # output activation chosen outside (MSE uses identity)
+            nn.Linear(256, 28*28),
+            nn.Sigmoid()
         )
 
-        # We'll correct fc sizes based on dataset resolution when building
-        self._in_channels = in_channels
+    def forward(self, z):
+        x = self.net(z)
+        return x.view(-1, 1, 28, 28)
 
-    def _infer_and_fix(self, x):
-        # Run encoder convs and adapt linear shapes once
-        with torch.no_grad():
-            h = self.enc(x)
-        flat = h.view(h.size(0), -1)
-        in_features = flat.size(1)
-        if self.fc_mu.in_features != in_features:
-            # reassign fc layers with correct sizes
-            self.fc_mu = nn.Linear(in_features, self.latent_dim).to(next(self.parameters()).device)
-            self.fc_logvar = nn.Linear(in_features, self.latent_dim).to(next(self.parameters()).device)
-            self.fc_dec = nn.Linear(self.latent_dim, in_features).to(next(self.parameters()).device)
 
-    def encode(self, x):
-        h = self.enc(x)
-        flat = h.view(h.size(0), -1)
-        mu = self.fc_mu(flat)
-        logvar = self.fc_logvar(flat)
-        return mu, logvar
+class VAE(nn.Module):
+    def __init__(self, latent_dim=16):
+        super().__init__()
+        self.encoder = Encoder(latent_dim)
+        self.decoder = Decoder(latent_dim)
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def decode(self, z):
-        h = self.fc_dec(z)
-        # reshape into conv feature map shape -> we assume 128 x 3 x 3 as used above
-        # compute channels & spatial dims from current dec structure
-        # We used convs resulting in 128 x 3 x 3 for both MNIST 28x28 and CIFAR 32x32 with current conv setup.
-        # See _infer_and_fix to ensure sizes align
-        h = h.view(h.size(0), 128, 3, 3)
-        x_rec = self.dec(h)
-        return x_rec
-
     def forward(self, x):
-        # dynamic fix for fc shapes
-        self._infer_and_fix(x)
-        mu, logvar = self.encode(x)
+        mu, logvar = self.encoder(x)
         z = self.reparameterize(mu, logvar)
-        x_rec = self.decode(z)
-        return x_rec, mu, logvar
+        x_hat = self.decoder(z)
+        return x_hat, mu, logvar
 
-# --------------------------
-# Loss
-# --------------------------
-def vae_loss(x, x_rec, mu, logvar, beta=1.0):
-    # Reconstruction loss: MSE (works better for continuous pixel-space)
-    recon = F.mse_loss(x_rec, x, reduction='sum')
-    # KL divergence (sum over batch)
-    kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    return recon + beta * kld, recon, kld
 
-# --------------------------
-# Dataset helpers: create dataset where "normal" = chosen class, anomalies = others
-# We'll train on normal-class images only (unsupervised)
-# For validation/test we produce labeled dataset (0 normal, 1 anomaly)
-# --------------------------
-def get_datasets(dataset_name='MNIST', data_dir='./data', normal_class=1):
-    if dataset_name == 'MNIST':
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-        ])
-        train_full = datasets.MNIST(data_dir, train=True, download=True, transform=transform)
-        test_full = datasets.MNIST(data_dir, train=False, download=True, transform=transform)
-    else: # CIFAR10
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-        ])
-        train_full = datasets.CIFAR10(data_dir, train=True, download=True, transform=transform)
-        test_full = datasets.CIFAR10(data_dir, train=False, download=True, transform=transform)
+vae = VAE(latent_dim=16).to(device)
 
-    # indices for normal class in train (only normals)
-    train_idx = [i for i, (_, y) in enumerate(train_full) if y == normal_class]
-    # split train into train/val from the normal-only images
-    random.shuffle(train_idx)
-    split = int(0.9 * len(train_idx))
-    train_idx_sub = train_idx[:split]
-    val_idx_sub = train_idx[split:]
 
-    # For validation we want normal+anomalies; sample some anomalous examples from train_full whose label != normal
-    val_anom_idx = [i for i, (_, y) in enumerate(train_full) if y != normal_class]
-    random.shuffle(val_anom_idx)
-    val_anom_idx = val_anom_idx[: len(val_idx_sub)]  # balance roughly
+# ------------------------------
+# 3) Loss Function
+# ------------------------------
 
-    # Build final validation set indices and labels
-    val_indices = val_idx_sub + val_anom_idx
-    val_labels = [0] * len(val_idx_sub) + [1] * len(val_anom_idx)
+def vae_loss(x, x_hat, mu, logvar, beta=1.0):
+    recon = nn.functional.mse_loss(x_hat, x, reduction="sum")
+    kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    return recon + beta * kl
 
-    # Test set uses test_full: normal class labeled 0, others labeled 1
-    test_indices = list(range(len(test_full)))
-    test_labels = [0 if test_full[i][1] == normal_class else 1 for i in test_indices]
 
-    # Wrap Subset datasets with labels for val/test
-    train_dataset = Subset(train_full, train_idx_sub)
+# ------------------------------
+# 4) Train VAE
+# ------------------------------
 
-    class LabeledSubset(Dataset):
-        def __init__(self, base_dataset, indices, labels=None):
-            self.base = base_dataset
-            self.indices = indices
-            if labels is not None:
-                self.labels = labels
-            else:
-                self.labels = [0 if self.base[i][1] == normal_class else 1 for i in indices]
-        def __len__(self): return len(self.indices)
-        def __getitem__(self, idx):
-            img, _ = self.base[self.indices[idx]]
-            return img, self.labels[idx]
+optimizer = optim.Adam(vae.parameters(), lr=1e-3)
 
-    val_dataset = LabeledSubset(train_full, val_indices, val_labels)
-    test_dataset = LabeledSubset(test_full, test_indices, test_labels)
+epochs = 20
+train_losses = []
+val_losses = []
 
-    # Determine input channels from a sample
-    x0, _ = train_full[0]
-    in_channels = x0.shape[0]
-    image_shape = x0.shape  # (C, H, W)
-    return train_dataset, val_dataset, test_dataset, in_channels, image_shape
+for ep in range(epochs):
+    vae.train()
+    ep_loss = 0
+    for (x,) in train_loader:
+        x = x.to(device)
+        optimizer.zero_grad()
+        x_hat, mu, logvar = vae(x)
+        loss = vae_loss(x, x_hat, mu, logvar)
+        loss.backward()
+        optimizer.step()
+        ep_loss += loss.item()
 
-# --------------------------
-# Training loop + utils
-# --------------------------
-def train_vae(model, train_loader, val_loader, device, epochs=20, lr=1e-3, beta=1.0):
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
-    model.to(device)
+    train_losses.append(ep_loss)
 
-    history = {'train_loss':[], 'train_recon':[], 'train_kld':[], 'val_loss':[], 'val_recon':[], 'val_kld':[]}
-    for epoch in range(1, epochs+1):
-        model.train()
-        tl = tr = tk = 0.0
-        for x, _ in train_loader:
-            x = x.to(device)
-            x_rec, mu, logvar = model(x)
-            loss, recon, kld = vae_loss(x, x_rec, mu, logvar, beta=beta)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            tl += loss.item()
-            tr += recon.item()
-            tk += kld.item()
-        n_train = len(train_loader.dataset)
-        history['train_loss'].append(tl / n_train)
-        history['train_recon'].append(tr / n_train)
-        history['train_kld'].append(tk / n_train)
-
-        # Validation step: compute average losses
-        model.eval()
-        vl = vr = vk = 0.0
-        with torch.no_grad():
-            for x, _ in val_loader:
-                x = x.to(device)
-                x_rec, mu, logvar = model(x)
-                loss, recon, kld = vae_loss(x, x_rec, mu, logvar, beta=beta)
-                vl += loss.item()
-                vr += recon.item()
-                vk += kld.item()
-        n_val = len(val_loader.dataset)
-        history['val_loss'].append(vl / n_val)
-        history['val_recon'].append(vr / n_val)
-        history['val_kld'].append(vk / n_val)
-
-        print(f"Epoch {epoch}/{epochs}  Train loss: {history['train_loss'][-1]:.4f}  Val loss: {history['val_loss'][-1]:.4f}")
-    return history
-
-def compute_reconstruction_errors(model, loader, device):
-    model.eval()
-    rec_errors = []
-    labels = []
+    # validation
+    vae.eval()
+    val_loss = 0
     with torch.no_grad():
-        for x, y in loader:
+        for (x,) in val_loader:
             x = x.to(device)
-            x_rec, mu, logvar = model(x)
-            # per-sample MSE (sum or mean)
-            # We'll compute mean per-sample MSE over pixels
-            per_sample_mse = F.mse_loss(x_rec, x, reduction='none')
-            per_sample_mse = per_sample_mse.view(per_sample_mse.size(0), -1).mean(dim=1)
-            rec_errors.extend(per_sample_mse.cpu().numpy().tolist())
-            labels.extend(y.numpy().tolist())
-    return np.array(rec_errors), np.array(labels)
+            x_hat, mu, logvar = vae(x)
+            val_loss += vae_loss(x, x_hat, mu, logvar).item()
 
-# --------------------------
-# Threshold selection & evaluation
-# --------------------------
-def select_thresholds(rec_errors_val, labels_val):
-    # Only use normal samples (label==0) to compute baseline
-    normal_errors = rec_errors_val[labels_val == 0]
-    mu = normal_errors.mean()
-    sigma = normal_errors.std()
-    # Simple methods:
-    t_mean_k = mu + 3 * sigma
-    t_percentile = np.percentile(normal_errors, 95)
-    # Another option: choose threshold that maximizes F1 on val set (requires labels with anomalies)
-    # We'll compute best F1 by scanning thresholds across full val set
-    thresholds = np.linspace(rec_errors_val.min(), rec_errors_val.max(), 500)
-    best_f1 = -1.0
-    best_t = thresholds[0]
-    for t in thresholds:
-        preds = (rec_errors_val > t).astype(int)
-        p, r, f, _ = precision_recall_fscore_support(labels_val, preds, average='binary', zero_division=0)
-        if f > best_f1:
-            best_f1 = f
-            best_t = t
-    return {'mean_3sigma': t_mean_k, 'percentile_95': t_percentile, 'best_f1_val': best_t, 'best_f1_score': best_f1}
+    val_losses.append(val_loss)
 
-def evaluate_at_threshold(rec_errors_test, labels_test, threshold):
-    preds = (rec_errors_test > threshold).astype(int)
-    p, r, f, _ = precision_recall_fscore_support(labels_test, preds, average='binary', zero_division=0)
-    auc = None
-    try:
-        auc = roc_auc_score(labels_test, rec_errors_test)
-    except Exception:
-        auc = float('nan')
-    return {'precision': p, 'recall': r, 'f1': f, 'auc': auc, 'threshold': threshold}
+    print(f"Epoch {ep+1}/{epochs} - Train Loss: {ep_loss:.2f} - Val Loss: {val_loss:.2f}")
 
-# --------------------------
-# Utility plotting
-# --------------------------
-def plot_history(history, out_dir):
-    plt.figure(figsize=(8,6))
-    plt.plot(history['train_loss'], label='train loss')
-    plt.plot(history['val_loss'], label='val loss')
-    plt.xlabel('epoch')
-    plt.ylabel('avg loss')
-    plt.legend()
-    plt.tight_layout()
-    p = Path(out_dir) / "plots" / "loss_curve.png"
-    plt.savefig(p)
-    plt.close()
-    print("Saved loss curve to", p)
 
-def plot_recon_examples(model, dataset, device, out_dir, n=8):
-    loader = DataLoader(dataset, batch_size=n, shuffle=True)
-    x, y = next(iter(loader))
-    x = x.to(device)
+# ------------------------------
+# 5) Anomaly Threshold (Mean + 3*std)
+# ------------------------------
+
+def reconstruction_error(x, x_hat):
+    return torch.mean((x - x_hat)**2, dim=[1,2,3])
+
+
+vae.eval()
+errors_val = []
+
+with torch.no_grad():
+    for (x,) in val_loader:
+        x = x.to(device)
+        x_hat, _, _ = vae(x)
+        err = reconstruction_error(x, x_hat)
+        errors_val.extend(err.cpu().numpy())
+
+errors_val = np.array(errors_val)
+threshold = errors_val.mean() + 3 * errors_val.std()
+
+print("Threshold =", threshold)
+
+
+# ------------------------------
+# 6) Testing: Normal vs Anomaly
+# ------------------------------
+
+def collect_errors(loader):
+    errs = []
     with torch.no_grad():
-        x_rec, mu, logvar = model(x)
-    x = x.cpu()
-    x_rec = x_rec.cpu()
-    # make grid
-    inp_grid = utils.make_grid(x, nrow=n)
-    rec_grid = utils.make_grid(x_rec, nrow=n)
-    fig, axes = plt.subplots(2,1, figsize=(10,5))
-    axes[0].imshow(np.transpose(inp_grid.numpy(), (1,2,0)), interpolation='nearest')
-    axes[0].set_title('Input samples')
-    axes[0].axis('off')
-    axes[1].imshow(np.transpose(rec_grid.numpy(), (1,2,0)), interpolation='nearest')
-    axes[1].set_title('Reconstructed samples')
-    axes[1].axis('off')
-    plt.tight_layout()
-    p = Path(out_dir) / "plots" / "recon_examples.png"
-    plt.savefig(p)
-    plt.close()
-    print("Saved recon examples to", p)
+        for (x,) in loader:
+            x = x.to(device)
+            x_hat, _, _ = vae(x)
+            err = reconstruction_error(x, x_hat)
+            errs.extend(err.cpu().numpy())
+    return np.array(errs)
 
-def plot_error_hist(rec_errors_val, labels_val, out_dir):
-    plt.figure(figsize=(8,5))
-    plt.hist(rec_errors_val[labels_val==0], bins=80, alpha=0.7, label='normal')
-    plt.hist(rec_errors_val[labels_val==1], bins=80, alpha=0.7, label='anomaly')
-    plt.legend()
-    plt.xlabel('reconstruction error (MSE)')
-    plt.ylabel('count')
-    plt.title('Reconstruction error distribution (val)')
-    p = Path(out_dir) / "plots" / "error_hist_val.png"
-    plt.savefig(p)
-    plt.close()
-    print("Saved error histogram to", p)
+normal_errors = collect_errors(test_normal_loader)
+anomaly_errors = collect_errors(test_anomaly_loader)
 
-# --------------------------
-# Main execution
-# --------------------------
-def main():
-    print("Configuration:", args)
-    train_dataset, val_dataset, test_dataset, in_channels, img_shape = get_datasets(args.dataset, args.data_dir, args.normal_class)
-    print("Datasets sizes: train", len(train_dataset), "val", len(val_dataset), "test", len(test_dataset))
-    print("Image shape:", img_shape)
+y_true = np.array([0]*len(normal_errors) + [1]*len(anomaly_errors))
+y_pred = np.array([
+    1 if e > threshold else 0
+    for e in np.concatenate([normal_errors, anomaly_errors])
+])
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
+precision = precision_score(y_true, y_pred)
+recall    = recall_score(y_true, y_pred)
+f1        = f1_score(y_true, y_pred)
 
-    model = ConvVAE(in_channels=in_channels, latent_dim=args.latent_dim)
-    history = train_vae(model, train_loader, val_loader, args.device, epochs=args.epochs, lr=args.lr, beta=args.beta)
+print("\n=== Final Metrics ===")
+print("Precision:", precision)
+print("Recall:", recall)
+print("F1-Score:", f1)
 
-    # Save model
-    model_path = Path(out_dir) / "models" / f"vae_{args.dataset}_normal{args.normal_class}.pt"
-    torch.save(model.state_dict(), model_path)
-    print("Saved model to", model_path)
 
-    # Plots
-    plot_history(history, out_dir)
-    plot_recon_examples(model, val_loader.dataset, args.device, out_dir)
-    # Compute reconstruction errors on val
-    rec_val, labels_val = compute_reconstruction_errors(model, val_loader, args.device)
-    plot_error_hist(rec_val, labels_val, out_dir)
+# ------------------------------
+# 7) Visualization
+# ------------------------------
 
-    thresholds = select_thresholds(rec_val, labels_val)
-    print("Selected thresholds:", thresholds)
-    with open(Path(out_dir) / "selected_thresholds.json", 'w') as f:
-        json.dump(thresholds, f, indent=2)
+def show_reconstruction():
+    vae.eval()
+    x = next(iter(test_normal_loader))[0][:8].to(device)
+    x_hat, _, _ = vae(x)
 
-    # Evaluate on test
-    rec_test, labels_test = compute_reconstruction_errors(model, test_loader, args.device)
+    x = x.cpu().numpy()
+    x_hat = x_hat.cpu().numpy()
 
-    # Evaluate at thresholds
-    results = {}
-    for k,t in thresholds.items():
-        if k == 'best_f1_score': continue
-        # if key 'best_f1_val' -> t is best threshold
-        if k == 'best_f1_val':
-            thr = thresholds['best_f1_val']
-            res = evaluate_at_threshold(rec_test, labels_test, thr)
-            results['best_f1_val'] = res
-        else:
-            res = evaluate_at_threshold(rec_test, labels_test, t)
-            results[k] = res
+    plt.figure(figsize=(12, 3))
+    for i in range(8):
+        plt.subplot(2, 8, i+1)
+        plt.imshow(x[i][0], cmap="gray")
+        plt.axis("off")
 
-    # Also compute best test F1 by scanning
-    threshs = np.linspace(rec_test.min(), rec_test.max(), 500)
-    best_f1_test = -1; best_t_test=None
-    for t in threshs:
-        preds = (rec_test > t).astype(int)
-        p, r, f, _ = precision_recall_fscore_support(labels_test, preds, average='binary', zero_division=0)
-        if f > best_f1_test:
-            best_f1_test = f; best_t_test = t
-    results['best_f1_test'] = evaluate_at_threshold(rec_test, labels_test, best_t_test)
-    results['best_f1_test']['best_t'] = best_t_test
-    print("Evaluation results on test:", results)
+        plt.subplot(2, 8, 8+i+1)
+        plt.imshow(x_hat[i][0], cmap="gray")
+        plt.axis("off")
 
-    # Save results CSV
-    df_res = pd.DataFrame.from_dict(results, orient='index')
-    df_res.to_csv(Path(out_dir) / "results_summary.csv")
-    print("Saved results summary to", Path(out_dir) / "results_summary.csv")
+    plt.show()
 
-    # Save reconstruction errors (test) for analysis
-    df_err = pd.DataFrame({'recon_error': rec_test, 'label': labels_test})
-    df_err.to_csv(Path(out_dir) / "reconstruction_errors_test.csv", index=False)
 
-    # If user wants, show ROC, PR curves saved
-    try:
-        fpr, tpr, _ = roc_curve(labels_test, rec_test)
-        plt.figure(); plt.plot(fpr, tpr); plt.xlabel('FPR'); plt.ylabel('TPR'); plt.title('ROC'); plt.savefig(Path(out_dir)/"plots"/"roc.png"); plt.close()
-        precision, recall, _ = precision_recall_curve(labels_test, rec_test)
-        plt.figure(); plt.plot(recall, precision); plt.xlabel('Recall'); plt.ylabel('Precision'); plt.title('Precision-Recall'); plt.savefig(Path(out_dir)/"plots"/"pr_curve.png"); plt.close()
-        print("Saved ROC and PR curves.")
-    except Exception as e:
-        print("Could not compute ROC/PR:", e)
-
-    print("Done. Output directory:", out_dir)
-
-if __name__ == "__main__":
-    main()
+show_reconstruction()
